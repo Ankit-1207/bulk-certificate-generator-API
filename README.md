@@ -1,6 +1,6 @@
 # Bulk Certificate Generator
 
-[![tests](https://github.com/Ankit-1207/bulk-certificate-generator/actions/workflows/tests.yml/badge.svg)](https://github.com/Ankit-1207/bulk-certificate-generator/actions/workflows/tests.yml)
+[![tests](https://github.com/Ankit-1207/bulk-certificate-generator-API/actions/workflows/tests.yml/badge.svg)](https://github.com/Ankit-1207/bulk-certificate-generator-API/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.x-red)
@@ -66,8 +66,8 @@ the results one at a time or as a single ZIP.
 Requires **Python 3.11+**.
 
 ```bash
-git clone https://github.com/Ankit-1207/bulk-certificate-generator.git
-cd bulk-certificate-generator
+git clone https://github.com/Ankit-1207/bulk-certificate-generator-API.git
+cd bulk-certificate-generator-API
 
 python -m venv .venv
 # Windows:      .venv\Scripts\activate
