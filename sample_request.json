@@ -1,0 +1,15 @@
+{
+  "certificate": {
+    "title": "Certificate of Completion",
+    "course_name": "Backend Engineering with FastAPI",
+    "issuer": "Acme Academy",
+    "issue_date": "2026-10-01"
+  },
+  "recipients": [
+    {"name": "Alice Johnson", "email": "alice@example.com"},
+    {"name": "Bob Smith", "email": "bob@example.com"},
+    {"name": "Renée Françoise Dubois", "email": "renee@example.com"},
+    {"name": "", "email": "missing-name@example.com"},
+    {"name": "Bad Email", "email": "not-an-email"}
+  ]
+}
