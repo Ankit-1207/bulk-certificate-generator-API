@@ -71,6 +71,26 @@ class RecipientIn(BaseModel):
 
 
 class CreateJobRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "certificate": {
+                        "title": "Certificate of Completion",
+                        "course_name": "Backend Engineering with FastAPI",
+                        "issuer": "Acme Academy",
+                        "issue_date": "2026-10-01",
+                    },
+                    "recipients": [
+                        {"name": "Alice Johnson", "email": "alice@example.com"},
+                        {"name": "Bob Smith", "email": "bob@example.com"},
+                        {"name": "", "email": "invalid-row@example.com"},
+                    ],
+                }
+            ]
+        }
+    )
+
     certificate: CertificateDetails
     # Deliberately loose: each row is validated individually so that one bad
     # recipient does not reject the whole batch.
@@ -178,3 +198,28 @@ class VerificationResponse(BaseModel):
     issuer: str
     issue_date: date
     certificate_id: str
+
+
+class JobSummary(BaseModel):
+    job_id: str
+    status: JobStatus
+    title: str
+    course_name: str
+    total_recipients: int
+    created_at: datetime
+    completed_at: datetime | None
+    status_url: str
+
+
+class JobList(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[JobSummary]
+
+
+class RetryResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    retried: int
+    status_url: str

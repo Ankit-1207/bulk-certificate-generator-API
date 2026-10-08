@@ -1,5 +1,6 @@
 from datetime import date
 
+import pytest
 from pypdf import PdfReader
 
 from app.config import settings
@@ -72,3 +73,19 @@ def test_process_job_is_not_run_twice(db, monkeypatch):
     job_service.process_job(job.id)
 
     assert calls == []
+
+
+def test_failed_render_leaves_no_partial_files(tmp_path, monkeypatch):
+    output = tmp_path / "renders" / "cert.pdf"
+
+    def explode(data, path):
+        path.write_bytes(b"%PDF partial")
+        raise RuntimeError("renderer crashed")
+
+    monkeypatch.setattr("app.services.renderer._draw", explode)
+    data = CertificateData("Alice", "Award", "Course", "Issuer", date(2026, 1, 1), "CODE")
+
+    with pytest.raises(RuntimeError):
+        render_certificate(data, output)
+
+    assert list(output.parent.iterdir()) == []

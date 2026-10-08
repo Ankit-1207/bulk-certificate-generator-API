@@ -1,14 +1,19 @@
 """HTTP endpoints."""
 
-import io
+import logging
+import os
 import re
+import secrets
+import tempfile
 import unicodedata
 import zipfile
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security, status
+from fastapi.responses import FileResponse
+from fastapi.security import APIKeyHeader
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app.config import settings
 from app.database import get_db
@@ -19,12 +24,29 @@ from app.schemas import (
     CertificateOut,
     CreateJobRequest,
     JobCreatedResponse,
+    JobList,
     JobStatusResponse,
+    JobSummary,
+    RetryResponse,
     VerificationResponse,
 )
 from app.services import jobs as job_service
+from app.services.worker import worker
 
-router = APIRouter(prefix="/api/v1")
+logger = logging.getLogger(__name__)
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(api_key: str | None = Security(api_key_header)) -> None:
+    """No-op unless API_KEY is configured. compare_digest avoids timing leaks."""
+    if settings.api_key and not secrets.compare_digest(api_key or "", settings.api_key):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
+
+
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_api_key)])
+# Verification is meant for third parties (e.g. an employer checking a certificate).
+public_router = APIRouter(prefix="/api/v1", tags=["verification"])
 
 
 # ---------------------------------------------------------------------------
@@ -80,18 +102,14 @@ def _download_filename(cert: Certificate) -> str:
     "/jobs",
     response_model=JobCreatedResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    tags=["jobs"],
     summary="Submit a bulk certificate generation request",
 )
-def create_job(
-    payload: CreateJobRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
+def create_job(payload: CreateJobRequest, request: Request, db: Session = Depends(get_db)):
     job, row_errors = job_service.create_job(db, payload)
     if job.status == JobStatus.PENDING:
-        # Generation runs after the response is sent; the client polls the status URL.
-        background_tasks.add_task(job_service.process_job, job.id)
+        # Generation happens on the worker pool; the client polls status_url.
+        worker.submit(job.id)
 
     return JobCreatedResponse(
         job_id=job.id,
@@ -105,7 +123,44 @@ def create_job(
     )
 
 
-@router.get("/jobs/{job_id}", response_model=JobStatusResponse, summary="Job status and progress")
+@router.get("/jobs", response_model=JobList, tags=["jobs"], summary="List jobs, newest first")
+def list_jobs(
+    request: Request,
+    status_filter: JobStatus | None = Query(None, alias="status"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    conditions = [GenerationJob.status == status_filter] if status_filter else []
+    total = db.scalar(select(func.count()).select_from(GenerationJob).where(*conditions))
+    found = db.scalars(
+        select(GenerationJob)
+        .where(*conditions)
+        .order_by(GenerationJob.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return JobList(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[
+            JobSummary(
+                job_id=job.id,
+                status=job.status,
+                title=job.title,
+                course_name=job.course_name,
+                total_recipients=job.total_recipients,
+                created_at=job.created_at,
+                completed_at=job.completed_at,
+                status_url=str(request.url_for("get_job", job_id=job.id)),
+            )
+            for job in found
+        ],
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["jobs"], summary="Job status and progress")
 def get_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     job = _get_job_or_404(db, job_id)
     progress = job_service.get_progress(db, job.id)
@@ -129,9 +184,32 @@ def get_job(job_id: str, request: Request, db: Session = Depends(get_db)):
     )
 
 
+@router.post(
+    "/jobs/{job_id}/retry",
+    response_model=RetryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["jobs"],
+    summary="Retry certificates that failed during generation",
+)
+def retry_job(job_id: str, request: Request, db: Session = Depends(get_db)):
+    _get_job_or_404(db, job_id)
+    try:
+        retried = job_service.reset_failed_certificates(db, job_id)
+    except job_service.JobConflict as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc))
+    worker.submit(job_id)
+    return RetryResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        retried=retried,
+        status_url=str(request.url_for("get_job", job_id=job_id)),
+    )
+
+
 @router.get(
     "/jobs/{job_id}/certificates",
     response_model=CertificateList,
+    tags=["certificates"],
     summary="List certificates of a job (filterable by status)",
 )
 def list_job_certificates(
@@ -162,8 +240,9 @@ def list_job_certificates(
 
 @router.get(
     "/jobs/{job_id}/download",
+    tags=["certificates"],
     summary="Download all generated certificates of a finished job as a ZIP",
-    response_class=Response,
+    response_class=FileResponse,
     responses={200: {"content": {"application/zip": {}}}},
 )
 def download_job_certificates(job_id: str, db: Session = Depends(get_db)):
@@ -179,17 +258,27 @@ def download_job_certificates(job_id: str, db: Session = Depends(get_db)):
     if not certs:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Job has no generated certificates")
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for cert in certs:
-            path = settings.storage_dir / cert.file_path
-            if path.exists():
-                archive.write(path, arcname=_download_filename(cert))
+    # Build the archive in a temp file (not memory) so large jobs don't blow up RAM;
+    # it is deleted once the response has been sent.
+    fd, zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for cert in certs:
+                path = settings.storage_dir / cert.file_path
+                if path.exists():
+                    archive.write(path, arcname=_download_filename(cert))
+                else:
+                    logger.warning("Certificate %s file missing from storage: %s", cert.id, path)
+    except Exception:
+        os.unlink(zip_path)
+        raise
 
-    return Response(
-        content=buffer.getvalue(),
+    return FileResponse(
+        zip_path,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="certificates_{job_id}.zip"'},
+        filename=f"certificates_{job_id}.zip",
+        background=BackgroundTask(os.unlink, zip_path),
     )
 
 
@@ -198,13 +287,19 @@ def download_job_certificates(job_id: str, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 
-@router.get("/certificates/{certificate_id}", response_model=CertificateOut, summary="Certificate details")
+@router.get(
+    "/certificates/{certificate_id}",
+    response_model=CertificateOut,
+    tags=["certificates"],
+    summary="Certificate details",
+)
 def get_certificate(certificate_id: str, request: Request, db: Session = Depends(get_db)):
     return _certificate_out(request, _get_certificate_or_404(db, certificate_id))
 
 
 @router.get(
     "/certificates/{certificate_id}/download",
+    tags=["certificates"],
     summary="Download a single certificate PDF",
     response_class=FileResponse,
     responses={200: {"content": {"application/pdf": {}}}},
@@ -222,7 +317,7 @@ def download_certificate(certificate_id: str, db: Session = Depends(get_db)):
     return FileResponse(path, media_type="application/pdf", filename=_download_filename(cert))
 
 
-@router.get(
+@public_router.get(
     "/verify/{verification_code}",
     response_model=VerificationResponse,
     summary="Verify a certificate by the code printed on it",

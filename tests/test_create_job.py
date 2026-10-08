@@ -52,3 +52,7 @@ def test_bulk_job_with_many_recipients(client):
         "processed": 200,
         "percent_complete": 100.0,
     }
+
+
+def test_health_check(client):
+    assert client.get("/health").json() == {"status": "ok", "database": "ok"}

@@ -9,3 +9,4 @@ venv/
 certificates.db
 certificates.db-*
 storage/
+demo_output/

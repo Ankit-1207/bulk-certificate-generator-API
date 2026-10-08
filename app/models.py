@@ -9,7 +9,7 @@ import enum
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, Index, Integer, String, Text, TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -17,6 +17,28 @@ from app.database import Base
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Stores UTC and always returns timezone-aware datetimes.
+
+    SQLite has no timezone support and hands back naive values, which would make
+    the API emit timestamps without an offset. This keeps behaviour identical on
+    SQLite and PostgreSQL.
+    """
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
 
 
 def new_id() -> str:
@@ -65,9 +87,9 @@ class GenerationJob(Base):
     total_recipients: Mapped[int] = mapped_column(Integer)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)  # job-level crash
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     certificates: Mapped[list["Certificate"]] = relationship(
         back_populates="job", cascade="all, delete-orphan", order_by="Certificate.row_index"
@@ -76,10 +98,15 @@ class GenerationJob(Base):
 
 class Certificate(Base):
     __tablename__ = "certificates"
+    # Progress = GROUP BY status for one job; listing = filter by job (+status), order by row.
+    __table_args__ = (
+        Index("ix_certificates_job_status", "job_id", "status"),
+        Index("ix_certificates_job_row", "job_id", "row_index", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     job_id: Mapped[str] = mapped_column(
-        ForeignKey("generation_jobs.id", ondelete="CASCADE"), index=True
+        ForeignKey("generation_jobs.id", ondelete="CASCADE")
     )
     # Position of the recipient in the submitted list, so failures map back to input rows.
     row_index: Mapped[int] = mapped_column(Integer)
@@ -91,7 +118,6 @@ class Certificate(Base):
     status: Mapped[CertificateStatus] = mapped_column(
         Enum(CertificateStatus, values_callable=lambda e: [m.value for m in e], native_enum=False),
         default=CertificateStatus.PENDING,
-        index=True,
     )
     failure_stage: Mapped[FailureStage | None] = mapped_column(
         Enum(FailureStage, values_callable=lambda e: [m.value for m in e], native_enum=False),
@@ -104,7 +130,7 @@ class Certificate(Base):
     # Relative to settings.storage_dir.
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    generated_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     job: Mapped[GenerationJob] = relationship(back_populates="certificates")

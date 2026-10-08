@@ -56,13 +56,45 @@ def test_completed_job_status(client, db):
     assert body["download_url"].endswith(f"/api/v1/jobs/{job.id}/download")
 
 
-def test_resume_picks_up_interrupted_job(client, db):
+def test_interrupted_job_is_requeued_and_finished(client, db, monkeypatch):
     job = _create_unprocessed_job(db)
-    job.status = JobStatus.PROCESSING  # simulate a crash mid-run
+    first = db.query(Certificate).filter_by(job_id=job.id, row_index=0).one()
+    first.status = CertificateStatus.GENERATED  # finished before the "crash"
+    job.status = JobStatus.PROCESSING  # simulate a shutdown mid-run
     db.commit()
 
-    job_service.resume_unfinished_jobs()
+    assert job_service.requeue_interrupted_jobs(db) == [job.id]
+    rendered = []
+    real_render = job_service.renderer.render_certificate
+    monkeypatch.setattr(
+        job_service.renderer,
+        "render_certificate",
+        lambda data, path: rendered.append(data.recipient_name) or real_render(data, path),
+    )
+    job_service.process_job(job.id)
 
+    assert rendered == ["Bob Smith", "Carol White"]  # finished work is not redone
     body = client.get(f"/api/v1/jobs/{job.id}").json()
     assert body["status"] == "completed"
     assert body["progress"]["generated"] == 3
+
+
+def test_timestamps_are_timezone_aware(client):
+    body = client.post("/api/v1/jobs", json=make_payload()).json()
+    job = client.get(body["status_url"]).json()
+
+    for field in ("created_at", "started_at", "completed_at"):
+        assert job[field].endswith("Z") or job[field].endswith("+00:00"), job[field]
+
+
+def test_list_jobs_newest_first_with_status_filter(client):
+    first = client.post("/api/v1/jobs", json=make_payload(course_name="First")).json()
+    second = client.post("/api/v1/jobs", json=make_payload(course_name="Second")).json()
+    client.post("/api/v1/jobs", json=make_payload([{"name": "", "email": "x"}]))  # fails validation
+
+    listing = client.get("/api/v1/jobs").json()
+    assert listing["total"] == 3
+    assert [j["job_id"] for j in listing["items"][1:]] == [second["job_id"], first["job_id"]]
+
+    completed = client.get("/api/v1/jobs", params={"status": "completed"}).json()
+    assert completed["total"] == 2

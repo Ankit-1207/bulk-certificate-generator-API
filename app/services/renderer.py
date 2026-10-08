@@ -44,8 +44,17 @@ def render_certificate(data: CertificateData, output_path: Path) -> Path:
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_name(output_path.name + ".tmp")
+    try:
+        _draw(data, tmp_path)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return output_path
 
-    pdf = canvas.Canvas(str(tmp_path), pagesize=(PAGE_WIDTH, PAGE_HEIGHT))
+
+def _draw(data: CertificateData, path: Path) -> None:
+    pdf = canvas.Canvas(str(path), pagesize=(PAGE_WIDTH, PAGE_HEIGHT))
     pdf.setTitle(f"{data.title} - {data.recipient_name}")
     pdf.setAuthor(data.issuer)
     pdf.setSubject(data.course_name)
@@ -116,6 +125,3 @@ def render_certificate(data: CertificateData, output_path: Path) -> Path:
 
     pdf.showPage()
     pdf.save()
-
-    os.replace(tmp_path, output_path)
-    return output_path

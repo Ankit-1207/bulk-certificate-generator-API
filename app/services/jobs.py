@@ -4,7 +4,7 @@ import logging
 import secrets
 from pathlib import Path
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -21,6 +21,10 @@ from app.schemas import CreateJobRequest, FieldError, Progress, RowValidationErr
 from app.services import renderer
 
 logger = logging.getLogger(__name__)
+
+
+class JobConflict(Exception):
+    """The requested operation is not valid in the job's current state."""
 
 
 def _verification_code() -> str:
@@ -101,16 +105,15 @@ def certificate_relative_path(cert: Certificate) -> Path:
     return Path(cert.job_id) / f"{cert.id}.pdf"
 
 
-def _claim_job(db: Session, job_id: str, resume: bool) -> bool:
-    """Atomically move the job into PROCESSING so it is never processed twice.
+def _claim_job(db: Session, job_id: str) -> bool:
+    """Atomically move the job PENDING -> PROCESSING.
 
-    resume=True also accepts a job already in PROCESSING (used on startup to pick
-    up work interrupted by a restart).
+    The conditional UPDATE means that if the same job is submitted twice (e.g. a
+    retry racing a restart), only one worker gets rowcount == 1 and proceeds.
     """
-    allowed = [JobStatus.PENDING, JobStatus.PROCESSING] if resume else [JobStatus.PENDING]
     result = db.execute(
         update(GenerationJob)
-        .where(GenerationJob.id == job_id, GenerationJob.status.in_(allowed))
+        .where(GenerationJob.id == job_id, GenerationJob.status == JobStatus.PENDING)
         .values(status=JobStatus.PROCESSING, started_at=func.coalesce(GenerationJob.started_at, utcnow()))
     )
     db.commit()
@@ -133,7 +136,7 @@ def _generate_one(job: GenerationJob, cert: Certificate) -> None:
     cert.file_path = relative.as_posix()
 
 
-def process_job(job_id: str, resume: bool = False) -> None:
+def process_job(job_id: str) -> None:
     """Generate every pending certificate of a job.
 
     Each certificate is generated and committed independently: an exception for
@@ -141,7 +144,7 @@ def process_job(job_id: str, resume: bool = False) -> None:
     to status requests while the job is running.
     """
     with SessionLocal() as db:
-        if not _claim_job(db, job_id, resume):
+        if not _claim_job(db, job_id):
             logger.info("Job %s not claimable (missing or already handled)", job_id)
             return
 
@@ -189,17 +192,68 @@ def _finalize(db: Session, job: GenerationJob) -> None:
     db.commit()
 
 
-def resume_unfinished_jobs() -> None:
-    """Called on startup: finish jobs left pending/processing by a previous run."""
-    with SessionLocal() as db:
-        job_ids = db.scalars(
-            select(GenerationJob.id).where(
-                GenerationJob.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
-            )
-        ).all()
-    for job_id in job_ids:
-        logger.info("Resuming unfinished job %s", job_id)
-        process_job(job_id, resume=True)
+def requeue_interrupted_jobs(db: Session) -> list[str]:
+    """Called once on startup. Returns the ids of jobs that still need work.
+
+    Jobs left in PROCESSING were interrupted by a shutdown/crash (the worker
+    pool lives in this process), so they go back to PENDING. Only certificates
+    still PENDING are generated when they run again, so finished work is kept.
+    Assumes a single API process owns the worker pool (see README).
+    """
+    db.execute(
+        update(GenerationJob)
+        .where(GenerationJob.status == JobStatus.PROCESSING)
+        .values(status=JobStatus.PENDING)
+    )
+    db.commit()
+    return list(
+        db.scalars(
+            select(GenerationJob.id)
+            .where(GenerationJob.status == JobStatus.PENDING)
+            .order_by(GenerationJob.created_at)
+        )
+    )
+
+
+def reset_failed_certificates(db: Session, job_id: str) -> int:
+    """Put a finished job's *generation* failures back to PENDING for another attempt.
+
+    Returns how many certificates will be (re)generated.
+
+    Validation failures are not retried: the input itself is wrong, so the
+    client has to submit corrected data in a new job.
+    """
+    reset = db.execute(
+        update(Certificate)
+        .where(
+            Certificate.job_id == job_id,
+            or_(
+                Certificate.failure_stage == FailureStage.GENERATION,
+                # left over if the job crashed mid-run
+                Certificate.status == CertificateStatus.PENDING,
+            ),
+        )
+        .values(status=CertificateStatus.PENDING, failure_stage=None, error_message=None)
+    ).rowcount
+    if reset == 0:
+        db.rollback()
+        raise JobConflict("Job has no generation failures to retry")
+
+    # Conditional on the job being finished, so a retry can't hit a running job.
+    reopened = db.execute(
+        update(GenerationJob)
+        .where(
+            GenerationJob.id == job_id,
+            GenerationJob.status.in_([JobStatus.COMPLETED_WITH_ERRORS, JobStatus.FAILED]),
+        )
+        .values(status=JobStatus.PENDING, completed_at=None, error_message=None)
+    ).rowcount
+    if reopened == 0:
+        db.rollback()
+        raise JobConflict("Job is still running")
+
+    db.commit()
+    return reset
 
 
 # ---------------------------------------------------------------------------
