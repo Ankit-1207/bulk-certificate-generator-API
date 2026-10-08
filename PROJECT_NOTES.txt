@@ -1,0 +1,172 @@
+BULK CERTIFICATE GENERATOR - PROJECT NOTES
+==========================================
+What was built, why, and how to work with it.
+Location: D:\OneDrive\Desktop\bulk-certificate-generator
+Last updated: 2026-10-08
+
+
+1. THE ASSIGNMENT
+-----------------
+Build a backend API (Python + FastAPI/Django/Flask + relational DB) that:
+  - accepts ONE request with MANY recipients
+  - validates recipient data
+  - generates a certificate per valid recipient from one predefined template
+  - tracks generation status / progress
+  - lets the client retrieve the generated certificates
+  - doesn't let one failed certificate stop the others
+  - has tests for: job creation, validation, generation, status/progress,
+    individual failure, retrieval
+  - has a README (setup, run, tests, usage, design decisions)
+
+
+2. WHAT WE USED
+---------------
+  FastAPI        - web framework (auto Swagger docs at /docs)
+  SQLAlchemy 2   - ORM; SQLite by default, any DB via DATABASE_URL
+  ReportLab      - draws the PDF certificate (pure Python, no extra installs)
+  ThreadPool     - background worker for generation
+  pytest + pypdf - tests (pypdf reads the PDFs back to check the text)
+
+
+3. HOW TO RUN
+-------------
+  pip install -r requirements.txt
+  uvicorn app.main:app --reload        -> http://127.0.0.1:8000/docs
+  python -m pytest                     -> runs 55 tests (~6 s)
+  python scripts/demo.py               -> full demo (server must be running)
+
+
+4. WHAT WE DID - TIMELINE
+-------------------------
+Round 1 - First version (commit e36d585)
+  - Project created on the Desktop with its own git repo
+  - API: create job, job status, list certificates, download PDF,
+    download ZIP, verify certificate
+  - Per-recipient validation, per-certificate failure isolation
+  - PDF template with border, title, name, course, date, issuer, verification code
+  - 39 tests, README
+  - Tested against a real running server; checked a generated PDF visually
+
+Round 2 - Review + hardening (commit a8ec03e)
+  - Moved generation from FastAPI BackgroundTasks to a dedicated worker pool
+    (BackgroundTasks share threads with API requests -> big jobs could slow
+    down status checks)
+  - Restart recovery: unfinished jobs are re-queued on startup; finished
+    certificates are NOT regenerated
+  - NEW: POST /jobs/{id}/retry - retries only generation failures
+  - NEW: GET /jobs - list jobs, newest first, filter by status
+  - NEW: optional API key (env API_KEY -> header X-API-Key); /verify stays public
+  - Timestamps always returned as UTC with timezone (SQLite drops it otherwise)
+  - ZIP built in a temp file instead of memory
+  - Renderer deletes its temp file if a render fails
+  - Composite DB index (job_id, status) for fast progress queries
+  - Example request shown in Swagger
+  - scripts/demo.py, docs/sample-certificate.png, GitHub Actions CI
+  - README rewritten for GitHub (diagrams, API table, design decisions)
+  - 55 tests, passing on installed libs AND latest library versions
+
+Round 3 - This notes file
+
+
+5. API ENDPOINTS (all under /api/v1)
+------------------------------------
+  POST /jobs                          submit request -> 202 + job_id
+  GET  /jobs                          list jobs
+  GET  /jobs/{job_id}                 status + progress
+  POST /jobs/{job_id}/retry           retry generation failures
+  GET  /jobs/{job_id}/certificates    per-recipient results (?status=failed)
+  GET  /jobs/{job_id}/download        ZIP of all generated PDFs
+  GET  /certificates/{id}             one certificate's details
+  GET  /certificates/{id}/download    one PDF
+  GET  /verify/{code}                 check a certificate (public)
+  GET  /health                        health check
+
+Job statuses:  pending -> processing -> completed
+                                     -> completed_with_errors
+                                     -> failed
+Certificate statuses: pending, generated, failed
+Failure stage: "validation" (bad input) or "generation" (PDF step failed)
+
+
+6. KEY DESIGN DECISIONS (interview talking points)
+--------------------------------------------------
+a) Background processing
+   POST returns 202 immediately; a worker pool generates PDFs; client polls.
+   Why: thousands of PDFs in one HTTP request would time out.
+   Next step for scale: Celery/RQ - process_job(job_id) works unchanged.
+
+b) Every input row is stored, even invalid ones
+   Each recipient becomes a Certificate row with its position (row_index),
+   so every success/failure maps back to the input list.
+
+c) Two levels of validation
+   - Whole request broken (no course, empty list, too many) -> 422, nothing saved
+   - One bad recipient (bad email, blank name, duplicate) -> job still runs,
+     that row is marked failed with the reason
+
+d) Failure isolation
+   Each certificate has its own try/except and its own DB commit.
+   One failure = one failed row; the loop continues.
+   Commit-per-certificate also makes live progress visible.
+
+e) Progress is counted, not stored
+   COUNT(*) GROUP BY status - one source of truth, counters can't drift.
+
+f) No double processing
+   Worker claims a job with "UPDATE ... WHERE status='pending'";
+   only the one that changes the row proceeds.
+
+g) Safe files
+   PDF written to .tmp then renamed -> never a half-written certificate.
+
+h) Font limitation
+   Built-in PDF fonts only cover Latin characters (e.g. Renee/Francoise with
+   accents OK). Other scripts (e.g. Chinese) are rejected at validation
+   instead of printing empty boxes. Fix: register a Unicode TTF font.
+
+
+7. WHERE THINGS ARE IN THE CODE
+-------------------------------
+  app/main.py              startup: create tables, start worker, re-queue jobs
+  app/api.py               all HTTP endpoints
+  app/schemas.py           request/response models + recipient validation
+  app/models.py            database tables (GenerationJob, Certificate)
+  app/database.py          DB connection setup
+  app/config.py            settings from environment variables
+  app/services/jobs.py     create / process / retry jobs, progress  <- MOST IMPORTANT
+  app/services/renderer.py the certificate template (PDF drawing)
+  app/services/worker.py   background worker pool
+  tests/                   55 tests (one file per area)
+
+
+8. SETTINGS (environment variables, all optional)
+-------------------------------------------------
+  DATABASE_URL            default sqlite:///./certificates.db
+  STORAGE_DIR             default ./storage
+  MAX_RECIPIENTS_PER_JOB  default 5000
+  WORKER_THREADS          default 2
+  RESUME_JOBS_ON_STARTUP  default true
+  API_KEY                 default unset (no auth)
+
+
+9. STILL TO DO
+--------------
+  [ ] Create an empty GitHub repo named bulk-certificate-generator
+  [ ] Push:
+        git remote add origin https://github.com/Ankit-1207/bulk-certificate-generator.git
+        git push -u origin main
+  [ ] If the repo name/username differs, fix the CI badge link in README.md
+  [ ] Check the "tests" workflow goes green on GitHub after the push
+  [ ] Read app/services/jobs.py and README "Design decisions" before the interview
+
+
+10. KNOWN LIMITS / FUTURE IDEAS (good "what would you improve?" answers)
+-------------------------------------------------------------------------
+  - Task queue (Celery/RQ) + multiple workers instead of in-process threads
+  - PostgreSQL + Alembic migrations instead of SQLite + create_all
+  - S3/object storage with signed URLs instead of local disk
+  - Unicode font for non-Latin names
+  - Webhook callback when a job finishes (instead of polling)
+  - CSV upload for recipient lists
+  - Idempotency-Key header so a repeated POST doesn't create a duplicate job
+  - No Dockerfile yet (Docker wasn't installed on this machine to test one)
